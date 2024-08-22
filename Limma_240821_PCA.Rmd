@@ -1,0 +1,368 @@
+---
+title: "OMG on Aug. 14"
+author: 'GQ'
+date: "08/21/2024"
+output:
+  word_document: default
+  pdf_document: default
+  df_print: paged
+  html_document: null
+---
+
+```{css, echo=FALSE}
+h3{text-align: center; 
+  color:#6495ED}
+   
+h4{text-align: right;
+  color:seagreen;}
+
+h5{text-align:left;
+  color:PaleVioletRed;}
+  
+p{color: black;}
+```
+
+### Background
+
+Data used in this report were first processed in two files, *QC_dataWranglingJuly30.Rmd* and *ReadinFeacureCountsAnnotation.R*.
+
+* Data wrangling performed in *QC_dataWranglingJuly30.Rmd*
+  +  organize all meta data together 
+  +  filter data by RIN and DS
+  
+     remove 4 samples with RIN equal to or less than 4
+     
+     remove 8 samples with abnormal DS
+  
+* Gene counts processed in *ReadinFeacureCountsAnnotation.R*
+  + Correct sample swaps
+
+
+### Outline 
+
+-Filter out lowly expressed genes
+
+-Cut drug into factors
+
+-Regress out two batch effects significantly correlated with PC1 rather than four batch effects 
+
+-Revisit the PCA to see which variables we should include in our models
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(edgeR)
+library(ggplot2)
+library(tidyverse)
+library(reshape2)
+library(variancePartition)
+library(ggpubr)
+```
+
+### Pooled data set (110 samples)
+
+To better know our data, variable names, summary statistics of numerical variables, and sample size for categorical variables were shown as below.
+
+Available variables: 
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Read in meta data
+meta <- read.csv("output/OMG_meta.csv") %>% 
+  mutate_at(c('Visit', 'sequence_pool', 'infant_sex'), factor)       # change categorical variables into factor
+
+names(meta)
+```
+
+Summary statistics of numerical variables
+```{r echo=FALSE}
+summary(meta[, c(3, 4, 6:10, 12, 13, 15)])
+meta <- meta %>% 
+  drop_na(OMG)
+```
+Sample size for sex (F-female, M-male) in each visit (v1/2/3/4 -- 1st/2nd/3rd/4th visit) as shown below.
+
+```{r echo=FALSE}
+table(meta$Visit, meta$sex)
+```
+
+### Removing lowly expressed genes
+
+Before filtering, I first annotated genes using the gene reference (basic gene annotation for GRCh38.p14 downloaded from GENCODE website), then filtered by Class (keeping "protein_coding"), and Chromosomes (removing "chrY" and "chrM"). At last, we have __19,878__ genes left.
+
+__Keeping genes that have a count per million (CPM) > 1 in at least 25% of samples__
+
+__11,460__ genes were left after filtering out lowly expressed genes.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# https://bioinformatics-core-shared-training.github.io/RNAseq-R/rna-seq-preprocessing.nb.html
+
+# Read in reads counts
+load(file="output/OMG_corrected_anno.RData")
+# keep samples' expression only in meta data
+OMG_corrected_anno <- OMG_corrected_anno[, 4:126] %>% 
+  select(meta$RNA_sampleID) %>% 
+  add_column(OMG_corrected_anno[, 1:3], .before=1)
+  
+# Remove first column from OMG_corrected_anno
+OMG <- OMG_corrected_anno %>% 
+  column_to_rownames(var = "Geneid") %>% 
+  select(-c(1, 2))
+
+#sum(meta_v1$RNA_sampleID == colnames(OMG))
+
+# store gene symbol  
+gene_symbol <-  OMG_corrected_anno[, c(1:3)] 
+
+OMG_dge <- DGEList(OMG_corrected_anno)          # add library size
+# https://biocellgen-public.svi.edu.au/sahmri-bulk-rnaseq/de.html
+```
+
+
+```{r echo=FALSE, warning=FALSE}
+keepGenes <- rowSums(cpm(OMG)>1) >= (0.25*ncol(OMG))
+
+OMG_filter <- OMG_dge[keepGenes,, keep.lib.sizes=FALSE]     # update library size
+
+beforeFiltering_plot <- OMG_dge %>% 
+  cpm(log = TRUE) %>% 
+  melt %>% 
+  dplyr::filter(is.finite(value)) %>% 
+  ggplot(aes(x = value, colour = Var2)) +
+  geom_density() + 
+  guides(colour = FALSE) +
+  ggtitle("A. Before filtering", subtitle = paste0(nrow(OMG), " genes")) +
+  labs(x = "logCPM", y = "Density") 
+
+afterFiltering_plot <- OMG_dge %>% 
+  cpm(log = TRUE) %>% 
+  magrittr::extract(keepGenes,) %>%
+  melt %>% 
+  dplyr::filter(is.finite(value)) %>% 
+  ggplot(aes(x = value, colour = Var2)) +
+  geom_density() + 
+  guides(colour = FALSE) +
+  ggtitle("B. After filtering", subtitle = paste0(table(keepGenes)[[2]], " genes"))+
+  labs(x = "logCPM", y = "Density")+
+  ylim(0, 0.25)
+
+cowplot::plot_grid(beforeFiltering_plot, afterFiltering_plot)
+```
+
+__Fig. 1 The density of log-CPM values for raw pre-filtered data (A) and post-filtered data (B) shown for each sample__
+
+Plot A shows lots of lowly expressed genes before filtering. 
+
+Plot B shows peaks of lowly expressed genes were removed after filtering.
+
+##### Normalizing gene expression distributions
+
+Using the method of **trimmed mean of M-values (TMM)** method to normalize and then remove batch effects. 
+
+TMM normalizes the library sizes to produce effective library sizes. 
+
+CPM values are counts normalized by the effective library sizes.
+
+```{r echo=FALSE, warning=FALSE, fig.width=8, fig.height=6}
+library(RColorBrewer)
+nsamples <- ncol(OMG)
+col <- rep(brewer.pal(nsamples, "Paired"), times=9)
+
+# barplot(OMG_dge$samples$lib.size, names=colnames(OMG_dge))
+# Get log2 counts per million
+logcounts <- cpm(OMG_filter, log = TRUE)
+
+boxplot(logcounts, main="A. Unnormalized data", ylab="log-CPM",col=col, cex.axis=0.5, las=2, cex=0.3)
+abline(h=median(logcounts),col="blue")
+
+tmm <- calcNormFactors(OMG_filter, method="TMM")    # update normalization factor
+lcpm <- cpm(tmm, log=TRUE, prior.count=3)
+boxplot(lcpm, col=col, main="", cex.axis=0.5, las=2, cex=0.3)
+title(main="B. Normalized data",ylab="Log-CPM")
+```
+
+__Fig. 2 Boxplots of log-CPM values showing expression distributions for unnormalised data (A) and normalised data (B) for each sample__
+
+Distributions before normalization are noticeably different. Blue line indicates the median of log-CPM.
+
+Distributions after normalization are similar. 
+
+
+
+### PCA
+
+
+```{r echo=FALSE}
+#Make sure the samples in the gene expression data and batch information data in the same sequence. codes doing the PCA
+
+# ge: TMM-normalized, voom transformed data; rows=genes, columns=samples
+# bat: covariate file: batch (make sure columns are as.numeric or as.factor. rows: samples (same order as gene expression (x) columns, columns are batch info)
+#OMG_keep <- subset(OMG_corrected_anno, keepGenes)
+
+ge <- lcpm
+
+#all.equal(colnames(ge), meta$RNA_sampleID)
+```
+
+
+**Before batch effects removed**
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, cols.print = n}
+#Step 1: Find original PCs for gene expression and proportion of variance as follows:
+PCs <-  paste0("PC", 1:10) 
+PCA1 <- prcomp(t(ge), scale=FALSE, center=TRUE)         # run PCA working on matrix and t() returning a matrix
+pca_var1 <- summary(PCA1)$importance
+pca_var1_output <- round(pca_var1[, 1:10], 3)*100       # convert proportion of variance explained by PCs to percent
+# output
+#write.csv(pca_var1_output, "output/pca_var1.csv")
+
+library(ggfortify)
+autoplot(PCA1) + coord_flip() 
+```
+
+__Fig. 3 PCA plots of first two PCs__
+
+```{r echo=FALSE}
+autoplot(PCA1, meta, color="RIN") +  
+  scale_color_gradientn(colours = rainbow(5)) + 
+  coord_flip() 
+```
+
+__Fig. 4 PCA plots of first two PCs with  *RIN* colored by RIN levels__
+
+From this figure, we can see overall the higher RIN has the bigger PC1, vice versa.
+
+```{r echo=FALSE}
+autoplot(PCA1, meta, color="pct") +  
+  scale_color_gradientn(colours = rainbow(5)) + 
+  coord_flip() 
+```
+
+__Fig. 5 PCA plots of first two PCs with  *pct* colored by the proportion of uniquely mapped reads__
+
+It shows that overall the higher the proportion of uniquely mapped reads has the bigger PC1, vice versa.
+
+```{r echo=FALSE}
+autoplot(PCA1, meta, color="OMG") +  
+  scale_color_gradientn(colours = rainbow(5)) + 
+  coord_flip() 
+```
+
+
+__Fig. 6 PCA plots of first two PCs with  *OMG* colored by OMG levels__
+
+
+Here I use the color key as reference to divide the numeric OMG into three groups.
+
+**Converting OMG into three groups based on OMG levels in the PCA plot, see Fig. 4**
+
+OMG (0, 5] -- Low
+
+OMG (5, 7.5] -- Medium
+
+OMG (7.5, 13] -- High
+
+Sample size for each OMG group as shown below.
+
+```{r echo=FALSE}
+bat <- meta %>% 
+  drop_na(OMG) %>% 
+  mutate(OMG_factor=cut(OMG, breaks=c(0, 5, 7.5, 13), labels = c("Low", "Medium", "High")), .after=OMG) %>% 
+  select(-c(1, 2, 13))
+
+table(bat$OMG_factor)
+```
+
+__Table 1 Sample size for each OMG group__
+
+##### Assess correlation between all pairs of variables
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+form <- ~ RIN + RNA_conc + sequence_pool + pct + variables_of_interest
+
+# Compute Canonical Correlation Analysis (CCA)
+# between all pairs of variables.  # returns absolute correlation value
+C <- canCorPairs(form, bat)
+
+# graphics.off()
+#  par("mar")
+par(mar=c(1,1,1,1))
+# Plot correlation matrix between all pairs of variables
+
+plotCorrMatrix(C,  dendrogram = "none", cexRow=1, cexCol=1)
+```
+
+![](output/cor_plot.png){width=100%}
+
+**Fig. 7 Plot of correlation between all pairs of variables**
+
+
+__Come back to PCA table__
+```{r echo=FALSE}
+#Step 2: PCs before Batch Effects removed to see if any batch effects are correlated with PCs
+
+bat_pca1 <- matrix(ncol=ncol(bat), nrow=10)            # matrix to store results
+rownames(bat_pca1) <- PCs
+colnames(bat_pca1) <- colnames(bat)
+
+for(j in 1:ncol(bat_pca1)){                            # look at association between PCj ~ batch i
+  for(i in 1:length(PCs)){
+    data1= lm(PCA1$x[, i] ~ bat[, j])
+    bat_pca1[i,j]=anova(data1)$'Pr(>F)'[1] 
+  }
+}
+pca_cvar1 <- rbind(pca_var1_output, t(bat_pca1))[-c(1,3), ] %>% 
+  round(3)  # RIN 2X10^-10 mapped_pct 8X10^-11
+rownames(pca_cvar1)[rownames(pca_cvar1)=="Proportion of Variance"] <- "Proportion of Variance (%)"
+```
+
+![](output/pca_cvar1.png){width=100%}
+
+__Table 2 PCs table before batch effects removed__ 
+
+It shows the original proportion of variance explained by each PCs of gene expression, and p-values for the correlation between each PC and each variable. 
+
+**Regress batch effects**
+
+Regress out _RIN_ and _pct_ using removeBatchEffect(), a function from limma, while protecting _OMG_factor_.
+
+```{r echo=FALSE}
+# regress out technical effects
+design <- model.matrix(~ OMG_factor + RIN + pct, data=bat)
+MA_design <- design[, c(1, 3)]       # design matrix relating to OMG conditions to be preserved
+batch_design <- design[, -c(1, 3)]       # covariates -- matrix or vector of numeric covariates to be adjusted for
+#batch <- bat$sequence_pool          # batch --factors
+
+ge2 <- removeBatchEffect(ge, covariates = batch_design, design = MA_design)
+
+PCA2 <- prcomp(t(ge2), scale=FALSE, center=TRUE)     # run PCA na.action=na.omit
+        
+pca_var2 <- summary(PCA2)$importance
+pca_var2_output <- round(pca_var2[, 1:10], 3)*100 
+
+bat_pca2 <- matrix(ncol=ncol(bat), nrow=10) # matrix to store results
+rownames(bat_pca2) <- PCs
+colnames(bat_pca2) <- colnames(bat)
+
+for(j in 1:ncol(bat)){ # look at association between PCj ~ batch i
+  for(i in 1:length(PCs)){
+    data1= lm(PCA2$x[,i]~bat[,j])
+    bat_pca2[i,j]=anova(data1)$'Pr(>F)'[1] 
+  }
+}
+
+pca_cvar2 <- rbind(pca_var2_output,t(bat_pca2))[-c(1,3), ] %>% 
+  round(3)
+rownames(pca_cvar2)[rownames(pca_cvar2)=="Proportion of Variance"] <- "Proportion of Variance (%)"
+```
+![](output/pca_cvar2.png){width=100%}
+
+__Table 3 PCs table after *RIN* and *pct* removed__ 
+
+
+```{r echo=FALSE}
+autoplot(PCA2, bat, color="OMG_factor") +  
+  coord_flip() 
+```
+
+
+__Fig. 8 PCA plots of first two PCs with  *OMG* colored by OMG groups__
+
+
