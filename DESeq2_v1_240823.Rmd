@@ -1,0 +1,157 @@
+---
+title: "DESeq2_v1_2408"
+author: ""
+date: "2024-08-23"
+output: html_document
+---
+
+```{css, echo=FALSE}
+h3{text-align: center; 
+  color:#6495ED}
+   
+h4{text-align: right;
+  color:seagreen;}
+
+h5{text-align:left;
+  color:PaleVioletRed;}
+  
+p{color: black;}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(DESeq2)
+#library(pheatmap)
+library(DEGreport)
+library(edgeR)
+library(tidyverse)
+library(ggplot2)
+library(GWASTools)
+```
+
+## Goal
+Investigate OMG effect on gene expression at each visit
+
+```{r meta}
+meta <- read.csv("output/PMG_meta.csv") %>% 
+  mutate_at(c('Visit', 'sequence_pool', 'sex'), factor) %>% 
+  mutate(DHA_factor=cut(DHA, breaks=c(0, 5, 7.5, 13), labels = c("Low", "Medium", "High")), .after=DHA) %>%
+  select(-c(4, 5, 13))
+
+# Including numeric variables with large mean can induce collinearity with the intercept.Users should center and scale numeric variables in the design to improve GLM convergence.
+
+scale <- scale(meta[-49, -c(1, 2, 9, 11, 12)])  # remove the row with NA OMG
+
+meta_scale <- cbind(meta[-49, c(1, 2, 9, 11, 12)], scale) %>%
+  as.data.frame() %>%
+  remove_rownames() %>% 
+  column_to_rownames(var="RNA_sampleID")
+
+# Load gene expression data output from ReadinFeacureCountsAnnotation.R
+load(file="output/omg_corrected_anno.RData")
+# keep samples' expression only in meta data
+omg_corrected_anno <- omg_corrected_anno[, 4:126] %>% 
+  select(meta$RNA_sampleID) %>% 
+  add_column(omg_corrected_anno[, 1:3], .before=1)
+
+# only keep counts
+omg <- omg_corrected_anno %>% 
+  column_to_rownames(var = "Geneid") %>% 
+  select(-c(1, 2))
+
+# all.equal(colnames(omg), meta$RNA_sampleID)
+```
+
+##### Visit 1 
+```{r echo=FALSE}
+## Filter genes
+keep <- rowSums(cpm(omg)>1) >= (0.25*ncol(omg))
+data <- omg[keep,]   
+
+# store gene symbol  
+gene_ID <- omg_corrected_anno[, c(1:3)] %>% 
+  filter(Geneid %in% rownames(data))
+
+## Visit 1
+meta_scale_v1 <- meta_scale %>% 
+  filter(Visit == "v1") %>% 
+  select(-1)
+
+data1 <- data %>% 
+  select(rownames(meta_scale_v1))
+
+# check samples names consistent for counts and meta data
+# all.equal(colnames(data1), rownames(meta_scale_v1))
+```
+
+
+```{r echo=FALSE}
+## Create DESeq2Dataset object
+dds <- DESeqDataSetFromMatrix(
+  countData = data1, 
+  colData = meta_scale_v1, 
+  design = ~ RIN + pct + covariates + variableOfInterest)
+
+# Differential Expression Analysis
+dds <- DESeq(dds, test = "Wald")
+
+res1_HL <- results(dds, contrast = list(c("OMG_factor_High_vs_Low")), alpha = 0.05) %>% 
+  as.data.frame()
+
+#resultsNames(dds)
+res1_HL$gene<- gene_ID %>% 
+  filter(Geneid %in% rownames(res1_HL)) %>% 
+  select(GeneSymbol)
+
+# FDR 0.1
+sum(res1_HL$padj < 0.05, na.rm=TRUE)
+
+res_HL_table1 <- as_tibble(res1_HL) %>% 
+                  mutate(threshold_OE = padj < 0.05)
+```
+
+
+```{r}
+res1_ML <- results(dds, contrast = list(c("OMG_factor_Medium_vs_Low")), alpha = 0.05) %>% 
+  as.data.frame()
+
+#resultsNames(dds)
+res1_ML$gene<- gene_ID %>% 
+  filter(Geneid %in% rownames(res1_ML)) %>% 
+  select(GeneSymbol)
+
+# FDR 0.1
+sum(res1_ML$padj < 0.05, na.rm=TRUE)
+
+res_ML_table1 <- as_tibble(res1_ML) %>% 
+                  mutate(threshold_OE = padj < 0.05)
+```
+
+##### Visualization of differential expression results
+
+```{r}
+d <- plotCounts(dds, gene = which.min(res1_HL$padj), intgroup = "OMG", returnData=TRUE)
+
+ggplot(d, aes(x=OMG, y=count)) + 
+  geom_smooth(position=position_jitter(w=0.1,h=0)) + 
+  scale_y_log10(breaks=c(25,100,400))+
+  labs(title ="gene_name")
+```
+
+```{r}
+## Plot dispersion estimates
+plotDispEsts(dds)
+```
+
+
+```{r echo=FALSE}
+# Plot expression for single gene
+
+plotCounts(dds, gene=which.min(res$padj), intgroup="treatment", main = 'gene_name')
+degPlot(dds = ddsFull, res = resSig, n = 6, xs = "treatment")
+```
+
+https://hbctraining.github.io/DGE_workshop/lessons/08_DGE_LRT.html
+https://genviz.org/module-04-expression/0004/02/01/DifferentialExpression/
+http://www.sthda.com/english/wiki/rna-seq-differential-expression-work-flow-using-deseq2#google_vignette
+https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#pre-filtering
