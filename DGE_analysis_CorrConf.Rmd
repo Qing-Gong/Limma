@@ -1,0 +1,148 @@
+---
+title: "DGE_analysis_Time"
+author: ""
+date: "2024"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Subset for 2 visits
+
+```{r load library, echo=FALSE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(tidyverse)
+library(limma)
+library(parallel)
+library(FALCO)
+library(CorrConf)
+library(BCconf)
+```
+
+Read in gene expression data and covariates information
+
+```{r read in data, echo=FALSE}
+# read in all covariates
+covs_all <- read.csv("output/covs_gds.csv")
+
+# extract covariates of interest
+covs <- covs_all %>% 
+  filter(Visit %in% c('v1', 'v3') ) %>% 
+  select(1, 2, 4:8, 11:14) %>% 
+  column_to_rownames(var="RNA_sampleID") %>% 
+  mutate_at(c("sex", "treatment"), factor)
+
+# read in clean normalized gene expression data
+ge_full <-  read.csv("output/limma-trend_GE2.csv")
+
+# extract gene expression only for visit1
+ge <-  ge_full[, rownames(covs)] 
+
+#all.equal(rownames(covs), colnames(ge))
+
+table(covs$Visit, covs$treatment)
+
+test_factor <- paste(covs$Visit, covs$treatment, sep = ".")
+test_factor <- as.data.frame(factor(test_factor, c("v1.0", "v1.1", "v3.0", "v3.1"))) %>% 
+  rename(factor = 1) %>% 
+  mutate(v3.1=ifelse(factor == 'v3.1', 1, 0),
+    v3.0=ifelse(factor == 'v3.0', 1, 0),
+    v1.0=ifelse(factor == 'v1.0', 1, 0),
+    v1.1=ifelse(factor == 'v1.1', 1, 0)) %>% 
+mutate_at(c("v1.0", "v1.1", "v3.0", "v3.1"), as.factor)  
+
+# read in Latent Factors
+cov_random_LF <- read.table("output/cov_random_LF.txt") %>% 
+  mutate_at(c("treatment1", "infant_sexM"), as.factor) %>% 
+  rename(treatment = 2,
+    infant_sex = 4) %>% 
+  filter(row.names(.) %in% rownames(covs))
+```
+
+```{r echo=FALSE}
+############# Covariates when subject is treated as a random effect
+# creating a design matrix
+ge <- as.matrix(ge)
+
+design <- cbind(rep(1, 60), cov_random_LF$treatment, test_factor$v1.0, test_factor$v3.1, cov_random_LF$sex)
+
+# rename column names for design
+colnames(design) <- c("Intercept", "treatment", "v1.0", "v3.1", "sex")
+```
+
+**Differential gene expression analysis**
+
+- Treatment effect (FDR 0.05)
+
+```{r echo=FALSE}
+subj <- model.matrix(~as.factor(covs$Subject_ID) - 1)
+randomE <- list(diag(ncol(ge)), subj%*%t(subj))    #B list when subject included as a random effect
+
+falco_random <- FALCO::CBCV_plus(Y = ge, Cov = design, maxK = 25, B = randomE, nFolds = 3, simpleDelta = T) 
+
+k_hat <- falco_random$K.hat
+##4 latent factors
+
+ind.cov <- 3:4
+Contrast <- c(-1,1)
+
+out <- CorrConf::EstimateC_complete(Y = ge, K = k_hat, X = design[,ind.cov], Z = design[,-ind.cov], B = randomE, return.Bhat = T)
+
+out$Calc.pvalues <- CorrConf::Calc.pvalues(Y = ge, B = randomE, X = out$X, Z = out$Z, C = out$C, tau = out$tau.Bhat)
+Cov.total <- cbind(out$X,out$Z,out$C)
+
+Beta.diff <- c(out$Calc.pvalues$Beta.hat%*%Contrast)  #The difference between the omalizumab and control temporal changes. Values >0 mean the omga3 DNAm changed more than the placebo DNAm.
+
+Se.diff <- sqrt(sum(Contrast*c((solve(t(Cov.total)%*%solve( CorrConf::CreateV(randomE,out$Calc.pvalues$tau), Cov.total ))[1:2,1:2])%*%Contrast))) * sqrt(out$Calc.pvalues$Delta.hat)
+
+Pvalues.diff <- 2*pnorm(-abs( Beta.diff/Se.diff ))  #Pvalues for the difference
+
+smry <- cbind(ge_full[1:3], Beta.diff, Se.diff, Pvalues.diff) %>% 
+  rename(Beta = 4,
+    se = 5, 
+    P.Value = 6) %>% 
+  mutate(adj.P.Val = round(p.adjust(P.Value, "fdr"), 4)) %>% 
+  arrange(P.Value) 
+
+write.table(smry, "output/treatmentV13_corConf.txt")
+```
+
+#### Data visualization
+Volcano plot can be use to visualize the genes that are differentially expressed at a given fold-change and adjusted p-value
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+hlcol <- which(smry$adj.P.Val<= 0.05)
+
+#Technically a biased estimator of the fold change
+
+ggplot(smry, aes(x=Beta, y=-log10(adj.P.Val))) +
+    geom_point(aes(color="grey", size=0.9, alpha=0.4)) +
+    ggtitle('Omega3 effect over time (FDR 0.05)') +
+    labs(y=expression('-Log'[10]*' P'[adj]), x=expression('Beta')) +
+    theme_minimal() +
+    theme(legend.position="none", plot.title = element_text(size = rel(1.5), hjust = 0.5))+
+    geom_text_repel(data=smry[hlcol,], aes(x = Beta, y = -log10(adj.P.Val), label=symbol), size = 2)+
+    geom_point(data=smry[hlcol,], aes(x = Beta, y = -log10(adj.P.Val), color="red", size=0.9, alpha=0.4))+
+    scale_color_manual(values=c('gray','red'))
+```
+
+```{r echo=FALSE}
+pdss <- ge_full %>% 
+  filter(symbol == "gene_name") %>% 
+  pivot_longer(cols = CO_CW_001:CO_CW_123,
+               names_to = "Samples",
+               values_to = "gene_name") %>% 
+  right_join(covs_all[covs_all$Visit %in% c('v1', 'v3'), ], join_by(Samples == RNA_sampleID)) %>% 
+  filter(Visit %in% c('v1', 'v3')) %>% 
+  select(4, 5, 11, 17) %>% 
+  mutate_at(c("treatment", "Visit"), as.factor)
+
+pdss_t <- pdss %>% 
+  filter(treatment == 1)
+```
