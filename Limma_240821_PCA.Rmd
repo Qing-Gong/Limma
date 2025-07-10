@@ -339,6 +339,6 @@ autoplot(PCA2, bat, color="OMG_factor") +
 ```
 
 
-__Fig. 8 PCA plots of first two PCs with  *OMG* colored by OMG groups__
+__Fig. 7 PCA plots of first two PCs with  *OMG* colored by OMG groups__
 
 
