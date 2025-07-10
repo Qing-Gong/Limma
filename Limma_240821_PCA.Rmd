@@ -270,30 +270,6 @@ bat <- meta %>%
 table(bat$OMG_factor)
 ```
 
-__Table 1 Sample size for each OMG group__
-
-##### Assess correlation between all pairs of variables
-
-```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
-form <- ~ RIN + RNA_conc + sequence_pool + pct + variables_of_interest
-
-# Compute Canonical Correlation Analysis (CCA)
-# between all pairs of variables.  # returns absolute correlation value
-C <- canCorPairs(form, bat)
-
-# graphics.off()
-#  par("mar")
-par(mar=c(1,1,1,1))
-# Plot correlation matrix between all pairs of variables
-
-plotCorrMatrix(C,  dendrogram = "none", cexRow=1, cexCol=1)
-```
-
-![](output/cor_plot.png){width=100%}
-
-**Fig. 7 Plot of correlation between all pairs of variables**
-
-
 __Come back to PCA table__
 ```{r echo=FALSE}
 #Step 2: PCs before Batch Effects removed to see if any batch effects are correlated with PCs
